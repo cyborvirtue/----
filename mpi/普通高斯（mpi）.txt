@@ -1,0 +1,362 @@
+#include <mpi.h>
+#include <iostream>
+#include <fstream>
+#include <iomanip>
+#include <ctime>
+
+#include <cmath>
+#include <cstring>
+#include <omp.h>
+#include <chrono>
+#include <xmmintrin.h>  // SSE 指令集头文件
+
+using namespace std;
+using namespace chrono;
+
+#define ele_t float
+#define ZERO 1e-5
+
+#ifndef DATA_PATH
+#define DATA_PATH "./gauss.dat"  // 修改路径为当前目录
+#endif
+
+const int SIZES[] = { 10, 50, 100, 200, 400, 600, 800, 1000, 1200, 1400, 1600, 2000 }; // 测试的矩阵大小
+const int MAX_SIZE = 2000; // 最大矩阵大小
+float a[MAX_SIZE][MAX_SIZE];
+
+int world_size, world_rank;
+
+// 初始化矩阵，填充随机数
+void init(int n) {
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++)
+            a[i][j] = float(rand()) / RAND_MAX * 100;
+}
+
+// 测量算法执行时间的函数
+void measureExecutionTime(void (*algorithm)(int), int n) {
+    auto start = high_resolution_clock::now();
+    algorithm(n);
+    auto stop = high_resolution_clock::now();
+    auto duration = duration_cast<microseconds>(stop - start);
+    cout << "Execution time for N = " << n << ": " << duration.count() / 1000.0 << " milliseconds" << endl;
+}
+
+// 使用SSE进行内层循环优化
+void sse_optimized_subtract(ele_t* a, ele_t* b, ele_t div, int n) {
+    __m128 vec_div = _mm_set1_ps(div);
+    int i = 0;
+    for (; i <= n - 4; i += 4) {
+        __m128 vec_a = _mm_loadu_ps(&a[i]);
+        __m128 vec_b = _mm_loadu_ps(&b[i]);
+        __m128 vec_res = _mm_sub_ps(vec_a, _mm_mul_ps(vec_b, vec_div));
+        _mm_storeu_ps(&a[i], vec_res);
+    }
+    for (; i < n; ++i) {
+        a[i] -= b[i] * div;
+    }
+}
+
+// 串行算法（高斯消去法）
+void Serial(int n) {
+    for (int k = 0; k < n; ++k) {
+        for (int j = k + 1; j < n; ++j) {
+            a[k][j] /= a[k][k];
+        }
+        a[k][k] = 1.0;
+        for (int i = k + 1; i < n; ++i) {
+            for (int j = k + 1; j < n; ++j) {
+                a[i][j] -= a[i][k] * a[k][j];
+            }
+            a[i][k] = 0;
+        }
+    }
+}
+
+// MPI 主进程执行函数（块划分）
+void run_master(ele_t* _mat, int n) {
+    ele_t(*mat)[MAX_SIZE] = (ele_t(*)[MAX_SIZE])_mat;
+    for (int i = 0; i < n; i++) {
+        int n_lines = (n - i - 1) / world_size + 1;
+        n_lines = n_lines == 1 ? 0 : n_lines;
+        if (n_lines) {
+            MPI_Bcast(mat[i], sizeof(ele_t) * n, MPI_BYTE, 0, MPI_COMM_WORLD);
+            for (int th = 1; th < world_size; th++) {
+                MPI_Send(mat[i + 1 + (th - 1) * n_lines], sizeof(ele_t) * n * n_lines, MPI_BYTE, th, 0, MPI_COMM_WORLD);
+            }
+        }
+
+#pragma omp parallel for num_threads(4)
+        for (int j = i + 1 + (world_size - 1) * n_lines; j < n; j++) {
+            if (abs(mat[i][i]) < ZERO)
+                continue;
+            ele_t div = mat[j][i] / mat[i][i];
+            for (int k = i; k < n; k++)  // 未使用SSE优化
+                mat[j][k] -= mat[i][k] * div;
+        }
+
+        if (n_lines) {
+            for (int th = 1; th < world_size; th++) {
+                MPI_Recv(mat[i + 1 + (th - 1) * n_lines], sizeof(ele_t) * n * n_lines, MPI_BYTE, th, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            }
+        }
+    }
+}
+
+// MPI 从进程执行函数（块划分）
+void run_slave(int n) {
+    int n_lines;
+    ele_t lines_i[MAX_SIZE];
+
+    for (int i = 0; i < n; i++) {
+        n_lines = (n - i - 1) / world_size + 1;
+        if (n_lines == 1)
+            break;
+        MPI_Bcast(lines_i, sizeof(ele_t) * n, MPI_BYTE, 0, MPI_COMM_WORLD);
+        ele_t(*mat)[MAX_SIZE] = (ele_t(*)[MAX_SIZE])malloc(n_lines * n * sizeof(ele_t));
+        MPI_Recv(mat, n_lines * n * sizeof(ele_t), MPI_BYTE, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+#pragma omp parallel for num_threads(4)
+        for (int j = 0; j < n_lines; j++) {
+            if (abs(lines_i[i]) < ZERO)
+                continue;
+            ele_t div = mat[j][i] / lines_i[i];
+            for (int k = i; k < n; k++)  // 未使用SSE优化
+                mat[j][k] -= lines_i[k] * div;
+        }
+        MPI_Send(mat, n_lines * n * sizeof(ele_t), MPI_BYTE, 0, 1, MPI_COMM_WORLD);
+        free(mat);
+    }
+}
+
+// MPI 主进程执行函数（循环划分）
+void run_master_cyclic(ele_t* _mat, int n) {
+    ele_t(*mat)[MAX_SIZE] = (ele_t(*)[MAX_SIZE])_mat;
+    for (int i = 0; i < n; i++) {
+        MPI_Bcast(mat[i], sizeof(ele_t) * n, MPI_BYTE, 0, MPI_COMM_WORLD);
+#pragma omp parallel for num_threads(4)
+        for (int j = i + 1; j < n; j++) {
+            if ((j - (i + 1)) % world_size == 0) { // 循环划分
+                if (abs(mat[i][i]) < ZERO)
+                    continue;
+                ele_t div = mat[j][i] / mat[i][i];
+                for (int k = i; k < n; k++)  // 未使用SSE优化
+                    mat[j][k] -= mat[i][k] * div;
+            }
+        }
+        for (int th = 1; th < world_size; th++) {
+            for (int j = i + 1 + th; j < n; j += world_size) {
+                MPI_Send(mat[j], sizeof(ele_t) * n, MPI_BYTE, th, 0, MPI_COMM_WORLD);
+            }
+        }
+        for (int th = 1; th < world_size; th++) {
+            for (int j = i + 1 + th; j < n; j += world_size) {
+                MPI_Recv(mat[j], sizeof(ele_t) * n, MPI_BYTE, th, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            }
+        }
+    }
+}
+
+// MPI 从进程执行函数（循环划分）
+void run_slave_cyclic(int n) {
+    ele_t lines_i[MAX_SIZE];
+    for (int i = 0; i < n; i++) {
+        MPI_Bcast(lines_i, sizeof(ele_t) * n, MPI_BYTE, 0, MPI_COMM_WORLD);
+#pragma omp parallel for num_threads(4)
+        for (int j = i + 1 + world_rank; j < n; j += world_size) {
+            if (abs(lines_i[i]) < ZERO)
+                continue;
+            ele_t div = a[j][i] / lines_i[i];
+            for (int k = i; k < n; k++)  // 未使用SSE优化
+                a[j][k] -= lines_i[k] * div;
+        }
+        for (int j = i + 1 + world_rank; j < n; j += world_size) {
+            MPI_Send(a[j], sizeof(ele_t) * n, MPI_BYTE, 0, 1, MPI_COMM_WORLD);
+        }
+        for (int j = i + 1 + world_rank; j < n; j += world_size) {
+            MPI_Recv(a[j], sizeof(ele_t) * n, MPI_BYTE, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        }
+    }
+}
+
+// MPI 主进程执行函数（块划分，SSE优化）
+void run_master_sse(ele_t* _mat, int n) {
+    ele_t(*mat)[MAX_SIZE] = (ele_t(*)[MAX_SIZE])_mat;
+    for (int i = 0; i < n; i++) {
+        int n_lines = (n - i - 1) / world_size + 1;
+        n_lines = n_lines == 1 ? 0 : n_lines;
+        if (n_lines) {
+            MPI_Bcast(mat[i], sizeof(ele_t) * n, MPI_BYTE, 0, MPI_COMM_WORLD);
+            for (int th = 1; th < world_size; th++) {
+                MPI_Send(mat[i + 1 + (th - 1) * n_lines], sizeof(ele_t) * n * n_lines, MPI_BYTE, th, 0, MPI_COMM_WORLD);
+            }
+        }
+
+#pragma omp parallel for num_threads(4)
+        for (int j = i + 1 + (world_size - 1) * n_lines; j < n; j++) {
+            if (abs(mat[i][i]) < ZERO)
+                continue;
+            ele_t div = mat[j][i] / mat[i][i];
+            sse_optimized_subtract(mat[j], mat[i], div, n);
+        }
+
+        if (n_lines) {
+            for (int th = 1; th < world_size; th++) {
+                MPI_Recv(mat[i + 1 + (th - 1) * n_lines], sizeof(ele_t) * n * n_lines, MPI_BYTE, th, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            }
+        }
+    }
+}
+
+// MPI 从进程执行函数（块划分，SSE优化）
+void run_slave_sse(int n) {
+    int n_lines;
+    ele_t lines_i[MAX_SIZE];
+
+    for (int i = 0; i < n; i++) {
+        n_lines = (n - i - 1) / world_size + 1;
+        if (n_lines == 1)
+            break;
+        MPI_Bcast(lines_i, sizeof(ele_t) * n, MPI_BYTE, 0, MPI_COMM_WORLD);
+        ele_t(*mat)[MAX_SIZE] = (ele_t(*)[MAX_SIZE])malloc(n_lines * n * sizeof(ele_t));
+        MPI_Recv(mat, n_lines * n * sizeof(ele_t), MPI_BYTE, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+#pragma omp parallel for num_threads(4)
+        for (int j = 0; j < n_lines; j++) {
+            if (abs(lines_i[i]) < ZERO)
+                continue;
+            ele_t div = mat[j][i] / lines_i[i];
+            sse_optimized_subtract(mat[j], lines_i, div, n);
+        }
+        MPI_Send(mat, n_lines * n * sizeof(ele_t), MPI_BYTE, 0, 1, MPI_COMM_WORLD);
+        free(mat);
+    }
+}
+
+// MPI 主进程执行函数（循环划分，SSE优化）
+void run_master_cyclic_sse(ele_t* _mat, int n) {
+    ele_t(*mat)[MAX_SIZE] = (ele_t(*)[MAX_SIZE])_mat;
+    for (int i = 0; i < n; i++) {
+        MPI_Bcast(mat[i], sizeof(ele_t) * n, MPI_BYTE, 0, MPI_COMM_WORLD);
+#pragma omp parallel for num_threads(4)
+        for (int j = i + 1; j < n; j++) {
+            if ((j - (i + 1)) % world_size == 0) { // 循环划分
+                if (abs(mat[i][i]) < ZERO)
+                    continue;
+                ele_t div = mat[j][i] / mat[i][i];
+                sse_optimized_subtract(mat[j], mat[i], div, n);
+            }
+        }
+        for (int th = 1; th < world_size; th++) {
+            for (int j = i + 1 + th; j < n; j += world_size) {
+                MPI_Send(mat[j], sizeof(ele_t) * n, MPI_BYTE, th, 0, MPI_COMM_WORLD);
+            }
+        }
+        for (int th = 1; th < world_size; th++) {
+            for (int j = i + 1 + th; j < n; j += world_size) {
+                MPI_Recv(mat[j], sizeof(ele_t) * n, MPI_BYTE, th, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            }
+        }
+    }
+}
+
+// MPI 从进程执行函数（循环划分，SSE优化）
+void run_slave_cyclic_sse(int n) {
+    ele_t lines_i[MAX_SIZE];
+    for (int i = 0; i < n; i++) {
+        MPI_Bcast(lines_i, sizeof(ele_t) * n, MPI_BYTE, 0, MPI_COMM_WORLD);
+#pragma omp parallel for num_threads(4)
+        for (int j = i + 1 + world_rank; j < n; j += world_size) {
+            if (abs(lines_i[i]) < ZERO)
+                continue;
+            ele_t div = a[j][i] / lines_i[i];
+            sse_optimized_subtract(a[j], lines_i, div, n);
+        }
+        for (int j = i + 1 + world_rank; j < n; j += world_size) {
+            MPI_Send(a[j], sizeof(ele_t) * n, MPI_BYTE, 0, 1, MPI_COMM_WORLD);
+        }
+        for (int j = i + 1 + world_rank; j < n; j += world_size) {
+            MPI_Recv(a[j], sizeof(ele_t) * n, MPI_BYTE, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        }
+    }
+}
+
+// 包装函数，用于调用 run_master（块划分）
+void run_master_wrapper(int n) {
+    ele_t* _mat = new ele_t[MAX_SIZE * MAX_SIZE];
+    ifstream data(DATA_PATH, ios::in | ios::binary);
+    data.read((char*)_mat, MAX_SIZE * MAX_SIZE * sizeof(ele_t));
+    data.close();
+    run_master(_mat, n);
+    delete[] _mat;
+}
+
+// 包装函数，用于调用 run_master_cyclic（循环划分）
+void run_master_wrapper_cyclic(int n) {
+    ele_t* _mat = new ele_t[MAX_SIZE * MAX_SIZE];
+    ifstream data(DATA_PATH, ios::in | ios::binary);
+    data.read((char*)_mat, MAX_SIZE * MAX_SIZE * sizeof(ele_t));
+    data.close();
+    run_master_cyclic(_mat, n);
+    delete[] _mat;
+}
+
+// 包装函数，用于调用 run_master_sse（块划分，SSE优化）
+void run_master_wrapper_sse(int n) {
+    ele_t* _mat = new ele_t[MAX_SIZE * MAX_SIZE];
+    ifstream data(DATA_PATH, ios::in | ios::binary);
+    data.read((char*)_mat, MAX_SIZE * MAX_SIZE * sizeof(ele_t));
+    data.close();
+    run_master_sse(_mat, n);
+    delete[] _mat;
+}
+
+// 包装函数，用于调用 run_master_cyclic_sse（循环划分，SSE优化）
+void run_master_wrapper_cyclic_sse(int n) {
+    ele_t* _mat = new ele_t[MAX_SIZE * MAX_SIZE];
+    ifstream data(DATA_PATH, ios::in | ios::binary);
+    data.read((char*)_mat, MAX_SIZE * MAX_SIZE * sizeof(ele_t));
+    data.close();
+    run_master_cyclic_sse(_mat, n);
+    delete[] _mat;
+}
+
+int main(int argc, char** argv) {
+    MPI_Init(&argc, &argv);
+
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+
+    // 测试不同矩阵大小的串行算法执行时间
+    for (int size : SIZES) {
+        init(size);  // 初始化矩阵
+        if (world_rank == 0) {
+            cout << "Serial Algorithm for size " << size << ":" << endl;
+            measureExecutionTime(Serial, size);
+        }
+    }
+
+    // 测试不同矩阵大小的 MPI 并行算法执行时间
+    if (world_rank == 0) {
+        for (int size : SIZES) {
+            init(size);  // 初始化矩阵
+            cout << "MPI Algorithm for size " << size << ":" << endl;
+            measureExecutionTime(run_master_wrapper, size);
+            cout << "MPI Cyclic Algorithm for size " << size << ":" << endl;
+            measureExecutionTime(run_master_wrapper_cyclic, size);
+            cout << "MPI SSE Algorithm for size " << size << ":" << endl;
+            measureExecutionTime(run_master_wrapper_sse, size);
+            cout << "MPI Cyclic SSE Algorithm for size " << size << ":" << endl;
+            measureExecutionTime(run_master_wrapper_cyclic_sse, size);
+        }
+    }
+    else {
+        for (int size : SIZES) {
+            run_slave(size);
+            run_slave_cyclic(size);
+            run_slave_sse(size);
+            run_slave_cyclic_sse(size);
+        }
+    }
+
+    MPI_Finalize();
+    return 0;
+}

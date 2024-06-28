@@ -1,0 +1,270 @@
+#include <iostream>
+#include <chrono>
+#include <cstring>
+#include <pthread.h>
+#include <immintrin.h>
+#include <condition_variable>
+#include <mutex>
+
+using namespace std;
+using namespace chrono;
+
+typedef unsigned int mat_t;  // 假设 mat_t 是一个足以存储位向量的类型
+
+const int COL = 2000;  // 最大列数
+const int ROW = 2000;  // 最大行数
+const int mat_L = 32;  // 假设每个 mat_t 可以存储 32 位
+const int SIZES[] = { 10, 50, 100, 200, 400, 600, 800, 1000, 1200, 1400, 1600, 2000 };
+mat_t ele[COL][COL / mat_L + 1]; // 消元子矩阵
+mat_t row[ROW][COL / mat_L + 1]; // 被消元行矩阵
+mat_t ele_tmp[COL][COL / mat_L + 1]; // 临时消元子矩阵
+mat_t row_tmp[ROW][COL / mat_L + 1]; // 临时被消元行矩阵
+
+struct ThreadData {
+    int start;  // 线程处理的起始行
+    int end;    // 线程处理的结束行
+    int n;      // 矩阵规模
+};
+
+void init(int n) {
+    // 初始化矩阵 ele 和 row
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < (COL / mat_L + 1); j++) {
+            ele[i][j] = rand();
+            row[i][j] = rand();
+        }
+    }
+}
+
+void groebner(int n) // 串行算法
+{
+    memcpy(ele_tmp, ele, sizeof(mat_t) * COL * (COL / mat_L + 1));
+    memcpy(row_tmp, row, sizeof(mat_t) * ROW * (COL / mat_L + 1));
+    for (int i = 0; i < n; i++) {
+        for (int j = COL; j >= 0; j--) {
+            if (row_tmp[i][j / mat_L] & ((mat_t)1 << (j % mat_L))) {
+                if (ele_tmp[j][j / mat_L] & ((mat_t)1 << (j % mat_L))) {
+                    for (int p = COL / mat_L; p >= 0; p--)
+                        row_tmp[i][p] ^= ele_tmp[j][p];
+                }
+                else {
+                    memcpy(ele_tmp[j], row_tmp[i], (COL / mat_L + 1) * sizeof(mat_t));
+                    break;
+                }
+            }
+        }
+    }
+}
+
+void groebner_sse(int n)
+{
+    memcpy(ele_tmp, ele, sizeof(mat_t) * COL * (COL / mat_L + 1));
+    memcpy(row_tmp, row, sizeof(mat_t) * ROW * (COL / mat_L + 1));
+    __m128i row_i, ele_j;
+
+    for (int i = 0; i < n; i++) {
+        for (int j = COL; j >= 0; j--) {
+            if (row_tmp[i][j / mat_L] & ((mat_t)1 << (j % mat_L))) {
+                if (ele_tmp[j][j / mat_L] & ((mat_t)1 << (j % mat_L))) {
+                    for (int p = 0; p < COL / 128; p++) { // 128 = 32 bits * 4 elements per vector
+                        row_i = _mm_loadu_si128((__m128i*)(row_tmp[i] + p * 4));
+                        ele_j = _mm_loadu_si128((__m128i*)(ele_tmp[j] + p * 4));
+                        _mm_storeu_si128((__m128i*)(row_tmp[i] + p * 4), _mm_xor_si128(row_i, ele_j));
+                    }
+                    for (int k = COL / 128 * 4; k <= COL / mat_L; k++) {
+                        row_tmp[i][k] ^= ele_tmp[j][k];
+                    }
+                }
+                else {
+                    memcpy(ele_tmp[j], row_tmp[i], (COL / mat_L + 1) * sizeof(mat_t));
+                    break;
+                }
+            }
+        }
+    }
+}
+
+void groebner_avx(int n)
+{
+    memcpy(ele_tmp, ele, sizeof(mat_t) * COL * (COL / mat_L + 1));
+    memcpy(row_tmp, row, sizeof(mat_t) * ROW * (COL / mat_L + 1));
+    __m256i row_i, ele_j;
+    for (int i = 0; i < n; i++) {
+        for (int j = COL; j >= 0; j--) {
+            if (row_tmp[i][j / mat_L] & ((mat_t)1 << (j % mat_L))) {
+                if (ele_tmp[j][j / mat_L] & ((mat_t)1 << (j % mat_L))) {
+                    for (int p = 0; p < COL / 256; p++) { // 256 = 32 bits * 8 elements per vector
+                        row_i = _mm256_loadu_si256((__m256i*)(row_tmp[i] + p * 8));
+                        ele_j = _mm256_loadu_si256((__m256i*)(ele_tmp[j] + p * 8));
+                        _mm256_storeu_si256((__m256i*)(row_tmp[i] + p * 8), _mm256_xor_si256(row_i, ele_j));
+                    }
+                    for (int k = COL / 256 * 8; k <= COL / mat_L; k++) {
+                        row_tmp[i][k] ^= ele_tmp[j][k];
+                    }
+                }
+                else {
+                    memcpy(ele_tmp[j], row_tmp[i], (COL / mat_L + 1) * sizeof(mat_t));
+                    break;
+                }
+            }
+        }
+    }
+}
+
+void* groebner_thread(void* arg) {
+    // 线程函数，处理指定范围的行
+    ThreadData* data = (ThreadData*)arg;
+    int start = data->start;
+    int end = data->end;
+    int n = data->n;
+
+    for (int i = start; i < end; i++) {
+        for (int j = COL; j >= 0; j--) {
+            if (row_tmp[i][j / mat_L] & ((mat_t)1 << (j % mat_L))) {
+                if (ele_tmp[j][j / mat_L] & ((mat_t)1 << (j % mat_L))) {
+                    for (int p = COL / mat_L; p >= 0; p--)
+                        row_tmp[i][p] ^= ele_tmp[j][p];
+                }
+                else {
+                    memcpy(ele_tmp[j], row_tmp[i], (COL / mat_L + 1) * sizeof(mat_t));
+                    break;
+                }
+            }
+        }
+    }
+
+    pthread_exit(nullptr);
+    return nullptr;
+}
+
+void groebner_pthread(int n) {
+    // 动态创建线程来并行化处理行
+    memcpy(ele_tmp, ele, sizeof(mat_t) * COL * (COL / mat_L + 1));
+    memcpy(row_tmp, row, sizeof(mat_t) * ROW * (COL / mat_L + 1));
+
+    int num_threads = 4;  // 你可以根据需要调整线程数
+    pthread_t threads[4];
+    ThreadData thread_data[4];
+
+    int rows_per_thread = n / num_threads;
+    for (int i = 0; i < num_threads; i++) {
+        thread_data[i].start = i * rows_per_thread;
+        thread_data[i].end = (i == num_threads - 1) ? n : (i + 1) * rows_per_thread;
+        thread_data[i].n = n;
+        pthread_create(&threads[i], nullptr, groebner_thread, (void*)&thread_data[i]);
+    }
+
+    for (int i = 0; i < num_threads; i++) {
+        pthread_join(threads[i], nullptr);
+    }
+}
+
+// 静态线程部分
+const int NUM_THREADS = 4;
+pthread_t static_threads[NUM_THREADS];
+ThreadData static_thread_data[NUM_THREADS];
+condition_variable cv;
+mutex mtx;
+bool ready = false;
+
+void* static_groebner_thread(void* arg) {
+    while (true) {
+        unique_lock<mutex> lock(mtx);
+        cv.wait(lock, [] {return ready; });
+        lock.unlock();
+
+        ThreadData* data = (ThreadData*)arg;
+        int start = data->start;
+        int end = data->end;
+        int n = data->n;
+
+        for (int i = start; i < end; i++) {
+            for (int j = COL; j >= 0; j--) {
+                if (row_tmp[i][j / mat_L] & ((mat_t)1 << (j % mat_L))) {
+                    if (ele_tmp[j][j / mat_L] & ((mat_t)1 << (j % mat_L))) {
+                        for (int p = COL / mat_L; p >= 0; p--)
+                            row_tmp[i][p] ^= ele_tmp[j][p];
+                    }
+                    else {
+                        memcpy(ele_tmp[j], row_tmp[i], (COL / mat_L + 1) * sizeof(mat_t));
+                        break;
+                    }
+                }
+            }
+        }
+        lock.lock();
+        ready = false;
+        lock.unlock();
+    }
+    return nullptr;
+}
+
+void initialize_threads() {
+    int rows_per_thread = ROW / NUM_THREADS;
+    for (int i = 0; i < NUM_THREADS; i++) {
+        static_thread_data[i].start = i * rows_per_thread;
+        static_thread_data[i].end = (i == NUM_THREADS - 1) ? ROW : (i + 1) * rows_per_thread;
+        static_thread_data[i].n = ROW;
+        pthread_create(&static_threads[i], nullptr, static_groebner_thread, (void*)&static_thread_data[i]);
+    }
+}
+
+void groebner_static_pthread(int n) {
+    memcpy(ele_tmp, ele, sizeof(mat_t) * COL * (COL / mat_L + 1));
+    memcpy(row_tmp, row, sizeof(mat_t) * ROW * (COL / mat_L + 1));
+
+    {
+        unique_lock<mutex> lock(mtx);
+        ready = true;
+    }
+    cv.notify_all();
+
+    for (int i = 0; i < NUM_THREADS; i++) {
+        pthread_join(static_threads[i], nullptr);
+    }
+}
+
+void measureExecutionTime(void (*algorithm)(int), int n) {
+    auto start = high_resolution_clock::now();
+    algorithm(n);
+    auto stop = high_resolution_clock::now();
+    auto duration = duration_cast<microseconds>(stop - start);
+    cout << "Execution time for N = " << n << ": " << duration.count() / 1000.0 << " milliseconds" << endl;
+}
+
+int main() {
+    initialize_threads();
+
+    for (int i : SIZES) {
+        // 测试串行算法
+        init(i);
+        cout << "Serial " << i << ":" << endl;
+        measureExecutionTime(groebner, i);
+    }
+    for (int i : SIZES) {
+        // 测试SSE算法
+        init(i);
+        cout << "SSE " << i << ":" << endl;
+        measureExecutionTime(groebner_sse, i);
+    }
+    for (int i : SIZES) {
+        // 测试AVX算法
+        init(i);
+        cout << "AVX " << i << ":" << endl;
+        measureExecutionTime(groebner_avx, i);
+    }
+    for (int i : SIZES) {
+        // 测试动态多线程算法
+        init(i);
+        cout << "Pthread " << i << ":" << endl;
+        measureExecutionTime(groebner_pthread, i);
+    }
+    for (int i : SIZES) {
+        // 测试静态多线程算法
+        init(i);
+        cout << "Static Pthread " << i << ":" << endl;
+        measureExecutionTime(groebner_static_pthread, i);
+    }
+
+    return 0;
+}

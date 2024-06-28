@@ -1,0 +1,332 @@
+#include <mpi.h>
+#include <windows.h>
+#include <process.h>
+#include <iostream>
+#include <fstream>
+#include <iomanip>
+#include <ctime>
+
+#include <cmath>
+#include <cstring>
+#include <omp.h>
+#include <chrono>
+
+using namespace std;
+using namespace chrono;
+
+#define ele_t float
+#define ZERO 1e-5
+
+#ifndef DATA_PATH
+#define DATA_PATH "./gauss.dat"  // 修改路径为当前目录
+#endif
+
+const int SIZES[] = { 10, 50, 100, 200, 400, 600, 800, 1000, 1200, 1400, 1600, 2000 }; // 测试的矩阵大小
+const int MAX_SIZE = 2000; // 最大矩阵大小
+float a[MAX_SIZE][MAX_SIZE];
+
+int world_size, world_rank;
+HANDLE barrier_event;
+CRITICAL_SECTION criticalSection;
+
+typedef struct {
+    ele_t(*mat)[MAX_SIZE];
+    int n;
+    int k;
+    int thread_id;
+    int num_threads;
+} thread_data_t;
+
+// 初始化矩阵，填充随机数
+void init(int n) {
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++)
+            a[i][j] = float(rand()) / RAND_MAX * 100;
+}
+
+// 测量算法执行时间的函数
+void measureExecutionTime(void (*algorithm)(int, int), int n, int num_threads) {
+    auto start = high_resolution_clock::now();
+    algorithm(n, num_threads);
+    auto stop = high_resolution_clock::now();
+    auto duration = duration_cast<microseconds>(stop - start);
+    cout << "Execution time for N = " << n << ": " << duration.count() / 1000.0 << " milliseconds" << endl;
+}
+
+// 线程处理函数（块划分）
+unsigned __stdcall thread_work_block(void* arg) {
+    thread_data_t* data = (thread_data_t*)arg;
+    ele_t(*mat)[MAX_SIZE] = data->mat;
+    int n = data->n;
+    int k = data->k;
+    int thread_id = data->thread_id;
+    int num_threads = data->num_threads;
+
+    for (int j = k + 1 + thread_id; j < n; j += num_threads) {
+        if (abs(mat[k][k]) < ZERO)
+            continue;
+        ele_t div = mat[j][k] / mat[k][k];
+        for (int i = k; i < n; i++) {
+            mat[j][i] -= mat[k][i] * div;
+        }
+    }
+    SetEvent(barrier_event);
+    return 0;
+}
+
+// 线程处理函数（循环划分）
+unsigned __stdcall thread_work_cyclic(void* arg) {
+    thread_data_t* data = (thread_data_t*)arg;
+    ele_t(*mat)[MAX_SIZE] = data->mat;
+    int n = data->n;
+    int k = data->k;
+    int thread_id = data->thread_id;
+    int num_threads = data->num_threads;
+
+    for (int j = k + 1 + thread_id; j < n; j += num_threads) {
+        if (abs(mat[k][k]) < ZERO)
+            continue;
+        ele_t div = mat[j][k] / mat[k][k];
+        for (int i = k; i < n; i++) {
+            mat[j][i] -= mat[k][i] * div;
+        }
+    }
+    SetEvent(barrier_event);
+    return 0;
+}
+
+// MPI 主进程执行函数（块划分，结合Pthreads）
+void run_master_pthread_block(ele_t* _mat, int n, int num_threads) {
+    ele_t(*mat)[MAX_SIZE] = (ele_t(*)[MAX_SIZE])_mat;
+    InitializeCriticalSection(&criticalSection);
+    barrier_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+
+    HANDLE threads[MAXIMUM_WAIT_OBJECTS];
+    thread_data_t thread_data[MAXIMUM_WAIT_OBJECTS];
+
+    for (int i = 0; i < num_threads; i++) {
+        threads[i] = (HANDLE)_beginthreadex(NULL, 0, thread_work_block, &thread_data[i], 0, NULL);
+    }
+
+    for (int k = 0; k < n; k++) {
+        int n_lines = (n - k - 1) / world_size + 1;
+        n_lines = n_lines == 1 ? 0 : n_lines;
+        if (n_lines) {
+            MPI_Bcast(mat[k], sizeof(ele_t) * n, MPI_BYTE, 0, MPI_COMM_WORLD);
+            for (int th = 1; th < world_size; th++) {
+                MPI_Send(mat[k + 1 + (th - 1) * n_lines], sizeof(ele_t) * n * n_lines, MPI_BYTE, th, 0, MPI_COMM_WORLD);
+            }
+        }
+
+        for (int i = 0; i < num_threads; i++) {
+            thread_data[i].mat = mat;
+            thread_data[i].n = n;
+            thread_data[i].k = k;
+            thread_data[i].thread_id = i;
+            thread_data[i].num_threads = num_threads;
+            ResetEvent(barrier_event);
+            SetEvent(barrier_event);
+        }
+
+        WaitForMultipleObjects(num_threads, threads, TRUE, INFINITE);
+
+        if (n_lines) {
+            for (int th = 1; th < world_size; th++) {
+                MPI_Recv(mat[k + 1 + (th - 1) * n_lines], sizeof(ele_t) * n * n_lines, MPI_BYTE, th, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            }
+        }
+    }
+
+    for (int i = 0; i < num_threads; i++) {
+        CloseHandle(threads[i]);
+    }
+
+    DeleteCriticalSection(&criticalSection);
+    CloseHandle(barrier_event);
+}
+
+// MPI 从进程执行函数（块划分，结合Pthreads）
+void run_slave_pthread_block(int n, int num_threads) {
+    InitializeCriticalSection(&criticalSection);
+    barrier_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+
+    int n_lines;
+    ele_t lines_i[MAX_SIZE];
+
+    HANDLE threads[MAXIMUM_WAIT_OBJECTS];
+    thread_data_t thread_data[MAXIMUM_WAIT_OBJECTS];
+
+    for (int i = 0; i < num_threads; i++) {
+        threads[i] = (HANDLE)_beginthreadex(NULL, 0, thread_work_block, &thread_data[i], 0, NULL);
+    }
+
+    for (int k = 0; k < n; k++) {
+        n_lines = (n - k - 1) / world_size + 1;
+        if (n_lines == 1)
+            break;
+        MPI_Bcast(lines_i, sizeof(ele_t) * n, MPI_BYTE, 0, MPI_COMM_WORLD);
+        ele_t(*mat)[MAX_SIZE] = (ele_t(*)[MAX_SIZE])malloc(n_lines * n * sizeof(ele_t));
+        MPI_Recv(mat, n_lines * n * sizeof(ele_t), MPI_BYTE, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+        for (int i = 0; i < num_threads; i++) {
+            thread_data[i].mat = mat;
+            thread_data[i].n = n;
+            thread_data[i].k = k;
+            thread_data[i].thread_id = i;
+            thread_data[i].num_threads = num_threads;
+            ResetEvent(barrier_event);
+            SetEvent(barrier_event);
+        }
+
+        WaitForMultipleObjects(num_threads, threads, TRUE, INFINITE);
+
+        MPI_Send(mat, n_lines * n * sizeof(ele_t), MPI_BYTE, 0, 1, MPI_COMM_WORLD);
+        free(mat);
+    }
+
+    for (int i = 0; i < num_threads; i++) {
+        CloseHandle(threads[i]);
+    }
+
+    DeleteCriticalSection(&criticalSection);
+    CloseHandle(barrier_event);
+}
+
+// MPI 主进程执行函数（循环划分，结合Pthreads）
+void run_master_pthread_cyclic(ele_t* _mat, int n, int num_threads) {
+    ele_t(*mat)[MAX_SIZE] = (ele_t(*)[MAX_SIZE])_mat;
+    InitializeCriticalSection(&criticalSection);
+    barrier_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+
+    HANDLE threads[MAXIMUM_WAIT_OBJECTS];
+    thread_data_t thread_data[MAXIMUM_WAIT_OBJECTS];
+
+    for (int i = 0; i < num_threads; i++) {
+        threads[i] = (HANDLE)_beginthreadex(NULL, 0, thread_work_cyclic, &thread_data[i], 0, NULL);
+    }
+
+    for (int k = 0; k < n; k++) {
+        MPI_Bcast(mat[k], sizeof(ele_t) * n, MPI_BYTE, 0, MPI_COMM_WORLD);
+
+        for (int i = 0; i < num_threads; i++) {
+            thread_data[i].mat = mat;
+            thread_data[i].n = n;
+            thread_data[i].k = k;
+            thread_data[i].thread_id = i;
+            thread_data[i].num_threads = num_threads;
+            ResetEvent(barrier_event);
+            SetEvent(barrier_event);
+        }
+
+        WaitForMultipleObjects(num_threads, threads, TRUE, INFINITE);
+
+        for (int th = 1; th < world_size; th++) {
+            for (int j = k + 1 + th; j < n; j += world_size) {
+                MPI_Send(mat[j], sizeof(ele_t) * n, MPI_BYTE, th, 0, MPI_COMM_WORLD);
+            }
+        }
+        for (int th = 1; th < world_size; th++) {
+            for (int j = k + 1 + th; j < n; j += world_size) {
+                MPI_Recv(mat[j], sizeof(ele_t) * n, MPI_BYTE, th, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            }
+        }
+    }
+
+    for (int i = 0; i < num_threads; i++) {
+        CloseHandle(threads[i]);
+    }
+
+    DeleteCriticalSection(&criticalSection);
+    CloseHandle(barrier_event);
+}
+
+// MPI 从进程执行函数（循环划分，结合Pthreads）
+void run_slave_pthread_cyclic(int n, int num_threads) {
+    InitializeCriticalSection(&criticalSection);
+    barrier_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+
+    ele_t lines_i[MAX_SIZE];
+
+    HANDLE threads[MAXIMUM_WAIT_OBJECTS];
+    thread_data_t thread_data[MAXIMUM_WAIT_OBJECTS];
+
+    for (int i = 0; i < num_threads; i++) {
+        threads[i] = (HANDLE)_beginthreadex(NULL, 0, thread_work_cyclic, &thread_data[i], 0, NULL);
+    }
+
+    for (int k = 0; k < n; k++) {
+        MPI_Bcast(lines_i, sizeof(ele_t) * n, MPI_BYTE, 0, MPI_COMM_WORLD);
+        ele_t(*mat)[MAX_SIZE] = (ele_t(*)[MAX_SIZE])malloc(n * sizeof(ele_t));
+
+        for (int i = 0; i < num_threads; i++) {
+            thread_data[i].mat = mat;
+            thread_data[i].n = n;
+            thread_data[i].k = k;
+            thread_data[i].thread_id = i;
+            thread_data[i].num_threads = num_threads;
+            ResetEvent(barrier_event);
+            SetEvent(barrier_event);
+        }
+
+        WaitForMultipleObjects(num_threads, threads, TRUE, INFINITE);
+
+        MPI_Send(mat, n * sizeof(ele_t), MPI_BYTE, 0, 1, MPI_COMM_WORLD);
+        free(mat);
+    }
+
+    for (int i = 0; i < num_threads; i++) {
+        CloseHandle(threads[i]);
+    }
+
+    DeleteCriticalSection(&criticalSection);
+    CloseHandle(barrier_event);
+}
+
+// 包装函数，用于调用 run_master_pthread_block（块划分）
+void run_master_wrapper_pthread_block(int n, int num_threads) {
+    ele_t* _mat = new ele_t[MAX_SIZE * MAX_SIZE];
+    ifstream data(DATA_PATH, ios::in | ios::binary);
+    data.read((char*)_mat, MAX_SIZE * MAX_SIZE * sizeof(ele_t));
+    data.close();
+    run_master_pthread_block(_mat, n, num_threads);
+    delete[] _mat;
+}
+
+// 包装函数，用于调用 run_master_pthread_cyclic（循环划分）
+void run_master_wrapper_pthread_cyclic(int n, int num_threads) {
+    ele_t* _mat = new ele_t[MAX_SIZE * MAX_SIZE];
+    ifstream data(DATA_PATH, ios::in | ios::binary);
+    data.read((char*)_mat, MAX_SIZE * MAX_SIZE * sizeof(ele_t));
+    data.close();
+    run_master_pthread_cyclic(_mat, n, num_threads);
+    delete[] _mat;
+}
+
+int main(int argc, char** argv) {
+    MPI_Init(&argc, &argv);
+
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+
+    int num_threads = 4;  // 固定初始化Pthreads线程数
+
+    // 测试不同矩阵大小的 MPI+Pthreads 并行算法执行时间
+    if (world_rank == 0) {
+        for (int size : SIZES) {
+            init(size);  // 初始化矩阵
+            cout << "MPI + Pthreads Block Algorithm for size " << size << ":" << endl;
+            measureExecutionTime(run_master_wrapper_pthread_block, size, num_threads);
+            cout << "MPI + Pthreads Cyclic Algorithm for size " << size << ":" << endl;
+            measureExecutionTime(run_master_wrapper_pthread_cyclic, size, num_threads);
+        }
+    }
+    else {
+        for (int size : SIZES) {
+            run_slave_pthread_block(size, num_threads);
+            run_slave_pthread_cyclic(size, num_threads);
+        }
+    }
+
+    MPI_Finalize();
+    return 0;
+}

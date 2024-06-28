@@ -1,0 +1,402 @@
+#include <iostream>
+#include <chrono>
+#include <pthread.h>
+#include <emmintrin.h> // SSE2
+#include <cstring>    // for memcpy
+
+using namespace std;
+using namespace chrono;
+
+const int SIZES[] = { 10, 50, 100, 200,300, 400, 600, 800, 1000, 1200, 1400, 1600, 2000 }; // 测试的矩阵大小
+const int MAX_SIZE = 2000; // 最大矩阵大小
+const int NUM_THREADS = 8; // 定义线程数量
+typedef float ele_t;
+ele_t a[MAX_SIZE][MAX_SIZE];
+ele_t new_mat[MAX_SIZE][MAX_SIZE];
+
+struct LU_data {
+    int i;    // 消去的轮次
+    int n;    // 矩阵大小
+    int begin;
+    int nLines;
+    int thread_id; // 线程ID
+    pthread_mutex_t startNext;
+    pthread_mutex_t finished;
+};
+
+LU_data thread_data[NUM_THREADS]; // 存储每个线程的参数
+
+void init(int n) {
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++)
+            a[i][j] = float(rand()) / RAND_MAX * 100;
+}
+
+// 串行算法
+void Serial(int n) {
+    memcpy(new_mat, a, sizeof(ele_t) * MAX_SIZE * MAX_SIZE);
+    for (int k = 0; k < n; k++) {
+        for (int j = k + 1; j < n; j++)
+            new_mat[k][j] /= new_mat[k][k];
+        new_mat[k][k] = 1.0;
+
+        for (int i = k + 1; i < n; i++) {
+            for (int j = k + 1; j < n; j++)
+                new_mat[i][j] -= new_mat[i][k] * new_mat[k][j];
+            new_mat[i][k] = 0;
+        }
+    }
+}
+
+// 动态并行算法
+void* subthread_LU(void* _params) {
+    LU_data* params = (LU_data*)_params;
+    int i = params->i;
+    int n = params->n;
+
+    for (int j = params->begin; j < params->begin + params->nLines; j++) {
+        if (new_mat[i][i] == 0)
+            continue;
+        ele_t div = new_mat[j][i] / new_mat[i][i];
+        for (int k = i; k < n; k++) {
+            new_mat[j][k] -= new_mat[i][k] * div;
+        }
+    }
+    pthread_exit(nullptr);
+    return nullptr; // 添加返回值
+}
+
+void LU_pthread(int n) {
+    memcpy(new_mat, a, sizeof(ele_t) * MAX_SIZE * MAX_SIZE);
+    pthread_t threads[NUM_THREADS];
+    LU_data attr[NUM_THREADS];
+
+    for (int i = 0; i < n; i++) {
+        int nLines = (n - i - 1) / NUM_THREADS;
+        if (nLines > 0) {
+            for (int th = 0; th < NUM_THREADS; th++) {
+                attr[th].n = n;
+                attr[th].i = i;
+                attr[th].nLines = nLines;
+                attr[th].begin = i + 1 + th * nLines;
+                int err = pthread_create(&threads[th], NULL, subthread_LU, (void*)&attr[th]);
+                if (err) {
+                    cout << "failed to create thread[" << th << "]" << endl;
+                    exit(-1);
+                }
+            }
+
+            for (int j = i + 1 + NUM_THREADS * nLines; j < n; j++) {
+                if (new_mat[i][i] == 0)
+                    continue;
+                ele_t div = new_mat[j][i] / new_mat[i][i];
+                for (int k = i; k < n; k++) {
+                    new_mat[j][k] -= new_mat[i][k] * div;
+                }
+            }
+
+            for (int th = 0; th < NUM_THREADS; th++)
+                pthread_join(threads[th], NULL);
+        }
+        else {
+            for (int j = i + 1; j < n; j++) {
+                if (new_mat[i][i] == 0)
+                    continue;
+                ele_t div = new_mat[j][i] / new_mat[i][i];
+                for (int k = i; k < n; k++) {
+                    new_mat[j][k] -= new_mat[i][k] * div;
+                }
+            }
+        }
+    }
+}
+
+// 静态并行算法
+void* subthread_static_LU(void* _params) {
+    LU_data* params = (LU_data*)_params;
+    int i = params->i;
+    int n = params->n;
+
+    while (true) {
+        pthread_mutex_lock(&(params->startNext));
+        i = params->i;
+        n = params->n;
+        for (int j = params->begin; j < params->begin + params->nLines; j++) {
+            if (new_mat[i][i] == 0)
+                continue;
+            ele_t div = new_mat[j][i] / new_mat[i][i];
+            for (int k = i; k < n; k++) {
+                new_mat[j][k] -= new_mat[i][k] * div;
+            }
+        }
+        pthread_mutex_unlock(&(params->finished));
+    }
+}
+
+void LU_static_thread(int n) {
+    memcpy(new_mat, a, sizeof(ele_t) * MAX_SIZE * MAX_SIZE);
+    pthread_t threads[NUM_THREADS];
+    LU_data attr[NUM_THREADS];
+
+    for (int th = 0; th < NUM_THREADS; th++) {
+        pthread_mutex_init(&attr[th].startNext, NULL);
+        pthread_mutex_init(&attr[th].finished, NULL);
+        pthread_mutex_lock(&attr[th].startNext);
+        pthread_mutex_lock(&attr[th].finished);
+        attr[th].thread_id = th;
+        attr[th].n = n;
+        int err = pthread_create(&threads[th], NULL, subthread_static_LU, (void*)&attr[th]);
+        if (err) {
+            cout << "failed to create thread[" << th << "]" << endl;
+            exit(-1);
+        }
+    }
+
+    for (int i = 0; i < n; i++) {
+        int nLines = (n - i - 1) / NUM_THREADS;
+
+        for (int th = 0; th < NUM_THREADS; th++) {
+            attr[th].i = i;
+            attr[th].nLines = nLines;
+            attr[th].begin = i + 1 + th * nLines;
+            pthread_mutex_unlock(&attr[th].startNext);
+        }
+
+        for (int j = i + 1 + NUM_THREADS * ((n - i - 1) / NUM_THREADS); j < n; j++) {
+            if (new_mat[i][i] == 0)
+                continue;
+            ele_t div = new_mat[j][i] / new_mat[i][i];
+            for (int k = i; k < n; k++)
+                new_mat[j][k] -= new_mat[i][k] * div;
+        }
+
+        for (int th = 0; th < NUM_THREADS; th++)
+            pthread_mutex_lock(&attr[th].finished);
+    }
+
+    for (int th = 0; th < NUM_THREADS; th++) {
+        pthread_mutex_destroy(&attr[th].startNext);
+        pthread_mutex_destroy(&attr[th].finished);
+    }
+}
+
+void SSE(int n) {
+    memcpy(new_mat, a, sizeof(ele_t) * MAX_SIZE * MAX_SIZE);
+    __m128 t0, t1, t2;
+    for (int k = 0; k < n; k++) {
+        float k_val = new_mat[k][k];
+        t0 = _mm_set1_ps(k_val);
+        for (int j = k + 1; j + 3 < n; j += 4) {
+            t1 = _mm_loadu_ps(&new_mat[k][j]);
+            t2 = _mm_div_ps(t1, t0);
+            _mm_storeu_ps(&new_mat[k][j], t2);
+        }
+        for (int j = n - (n - (k + 1)) % 4; j < n; j++)
+            new_mat[k][j] /= k_val;
+        new_mat[k][k] = 1.0;
+
+        for (int i = k + 1; i < n; i++) {
+            float i_val = new_mat[i][k];
+            t0 = _mm_set1_ps(i_val);
+            for (int j = k + 1; j + 3 < n; j += 4) {
+                t1 = _mm_loadu_ps(&new_mat[k][j]);
+                t2 = _mm_loadu_ps(&new_mat[i][j]);
+                __m128 t3 = _mm_mul_ps(t0, t1);
+                t2 = _mm_sub_ps(t2, t3);
+                _mm_storeu_ps(&new_mat[i][j], t2);
+            }
+            for (int j = n - (n - (k + 1)) % 4; j < n; j++)
+                new_mat[i][j] -= i_val * new_mat[k][j];
+            new_mat[i][k] = 0.0;
+        }
+    }
+}
+
+// 动态并行算法 + SSE 优化
+void* subthread_LU_SSE(void* _params) {
+    LU_data* params = (LU_data*)_params;
+    int i = params->i;
+    int n = params->n;
+
+    for (int j = params->begin; j < params->begin + params->nLines; j++) {
+        if (new_mat[i][i] == 0)
+            continue;
+        ele_t div = new_mat[j][i] / new_mat[i][i];
+        __m128 div4 = _mm_set1_ps(div);
+        for (int k = i; k < n; k += 4) {
+            __m128 mat_j = _mm_loadu_ps(&new_mat[j][k]);
+            __m128 mat_i = _mm_loadu_ps(&new_mat[i][k]);
+            __m128 result = _mm_sub_ps(mat_j, _mm_mul_ps(div4, mat_i));
+            _mm_storeu_ps(&new_mat[j][k], result);
+        }
+    }
+    pthread_exit(nullptr);
+    return nullptr;
+}
+
+void LU_pthread_SSE(int n) {
+    memcpy(new_mat, a, sizeof(ele_t) * MAX_SIZE * MAX_SIZE);
+    pthread_t threads[NUM_THREADS];
+    LU_data attr[NUM_THREADS];
+
+    for (int i = 0; i < n; i++) {
+        int nLines = (n - i - 1) / NUM_THREADS;
+        if (nLines > 0) {
+            for (int th = 0; th < NUM_THREADS; th++) {
+                attr[th].n = n;
+                attr[th].i = i;
+                attr[th].nLines = nLines;
+                attr[th].begin = i + 1 + th * nLines;
+                int err = pthread_create(&threads[th], NULL, subthread_LU_SSE, (void*)&attr[th]);
+                if (err) {
+                    cout << "failed to create thread[" << th << "]" << endl;
+                    exit(-1);
+                }
+            }
+
+            for (int j = i + 1 + NUM_THREADS * nLines; j < n; j++) {
+                if (new_mat[i][i] == 0)
+                    continue;
+                ele_t div = new_mat[j][i] / new_mat[i][i];
+                __m128 div4 = _mm_set1_ps(div);
+                for (int k = i; k < n; k += 4) {
+                    __m128 mat_j = _mm_loadu_ps(&new_mat[j][k]);
+                    __m128 mat_i = _mm_loadu_ps(&new_mat[i][k]);
+                    __m128 result = _mm_sub_ps(mat_j, _mm_mul_ps(div4, mat_i));
+                    _mm_storeu_ps(&new_mat[j][k], result);
+                }
+            }
+
+            for (int th = 0; th < NUM_THREADS; th++)
+                pthread_join(threads[th], NULL);
+        }
+        else {
+            for (int j = i + 1; j < n; j++) {
+                if (new_mat[i][i] == 0)
+                    continue;
+                ele_t div = new_mat[j][i] / new_mat[i][i];
+                __m128 div4 = _mm_set1_ps(div);
+                for (int k = i; k < n; k += 4) {
+                    __m128 mat_j = _mm_loadu_ps(&new_mat[j][k]);
+                    __m128 mat_i = _mm_loadu_ps(&new_mat[i][k]);
+                    __m128 result = _mm_sub_ps(mat_j, _mm_mul_ps(div4, mat_i));
+                    _mm_storeu_ps(&new_mat[j][k], result);
+                }
+            }
+        }
+    }
+}
+
+// 静态并行算法 + SSE 优化
+void* subthread_static_LU_SSE(void* _params) {
+    LU_data* params = (LU_data*)_params;
+    int i = params->i;
+    int n = params->n;
+
+    while (true) {
+        pthread_mutex_lock(&(params->startNext));
+        i = params->i;
+        n = params->n;
+        for (int j = params->begin; j < params->begin + params->nLines; j++) {
+            if (new_mat[i][i] == 0)
+                continue;
+            ele_t div = new_mat[j][i] / new_mat[i][i];
+            __m128 div4 = _mm_set1_ps(div);
+            for (int k = i; k < n; k += 4) {
+                __m128 mat_j = _mm_loadu_ps(&new_mat[j][k]);
+                __m128 mat_i = _mm_loadu_ps(&new_mat[i][k]);
+                __m128 result = _mm_sub_ps(mat_j, _mm_mul_ps(div4, mat_i));
+                _mm_storeu_ps(&new_mat[j][k], result);
+            }
+        }
+        pthread_mutex_unlock(&(params->finished));
+    }
+}
+
+void LU_static_thread_SSE(int n) {
+    memcpy(new_mat, a, sizeof(ele_t) * MAX_SIZE * MAX_SIZE);
+    pthread_t threads[NUM_THREADS];
+    LU_data attr[NUM_THREADS];
+
+    for (int th = 0; th < NUM_THREADS; th++) {
+        pthread_mutex_init(&attr[th].startNext, NULL);
+        pthread_mutex_init(&attr[th].finished, NULL);
+        pthread_mutex_lock(&attr[th].startNext);
+        pthread_mutex_lock(&attr[th].finished);
+        attr[th].thread_id = th;
+        attr[th].n = n;
+        int err = pthread_create(&threads[th], NULL, subthread_static_LU_SSE, (void*)&attr[th]);
+        if (err) {
+            cout << "failed to create thread[" << th << "]" << endl;
+            exit(-1);
+        }
+    }
+
+    for (int i = 0; i < n; i++) {
+        int nLines = (n - i - 1) / NUM_THREADS;
+
+        for (int th = 0; th < NUM_THREADS; th++) {
+            attr[th].i = i;
+            attr[th].nLines = nLines;
+            attr[th].begin = i + 1 + th * nLines;
+            pthread_mutex_unlock(&attr[th].startNext);
+        }
+
+        for (int j = i + 1 + NUM_THREADS * ((n - i - 1) / NUM_THREADS); j < n; j++) {
+            if (new_mat[i][i] == 0)
+                continue;
+            ele_t div = new_mat[j][i] / new_mat[i][i];
+            __m128 div4 = _mm_set1_ps(div);
+            for (int k = i; k < n; k += 4) {
+                __m128 mat_j = _mm_loadu_ps(&new_mat[j][k]);
+                __m128 mat_i = _mm_loadu_ps(&new_mat[i][k]);
+                __m128 result = _mm_sub_ps(mat_j, _mm_mul_ps(div4, mat_i));
+                _mm_storeu_ps(&new_mat[j][k], result);
+            }
+        }
+
+        for (int th = 0; th < NUM_THREADS; th++)
+            pthread_mutex_lock(&attr[th].finished);
+    }
+
+    for (int th = 0; th < NUM_THREADS; th++) {
+        pthread_mutex_destroy(&attr[th].startNext);
+        pthread_mutex_destroy(&attr[th].finished);
+    }
+}
+
+void measureExecutionTime(void (*algorithm)(int), int n) {
+    auto start = high_resolution_clock::now();
+    algorithm(n);
+    auto stop = high_resolution_clock::now();
+    auto duration = duration_cast<microseconds>(stop - start);
+    cout << "Execution time for N = " << n << ": " << duration.count() / 1000.0 << " milliseconds" << endl;
+}
+
+int main() {
+    for (int size : SIZES) {
+        init(size); // Initialize matrix of size `size`
+        cout << "Serial Algorithm for size " << size << ":" << endl;
+        measureExecutionTime(Serial, size);
+
+        init(size); // Re-initialize matrix of size `size`
+        cout << "Dynamic Parallel Algorithm for size " << size << ":" << endl;
+        measureExecutionTime(LU_pthread, size);
+
+        init(size); // Re-initialize matrix of size `size`
+        cout << "Static Parallel Algorithm for size " << size << ":" << endl;
+        measureExecutionTime(LU_static_thread, size);
+
+        init(size); // Re-initialize matrix of size `size`
+        cout << "Serial sse for size " << size << ":" << endl;
+        measureExecutionTime(SSE, size);
+
+        init(size); // Re-initialize matrix of size `size`
+        cout << "SSE Optimized Dynamic Parallel Algorithm for size " << size << ":" << endl;
+        measureExecutionTime(LU_pthread_SSE, size);
+
+        init(size); // Re-initialize matrix of size `size`
+        cout << "SSE Optimized Static Parallel Algorithm for size " << size << ":" << endl;
+        measureExecutionTime(LU_static_thread_SSE, size);
+    }
+}
